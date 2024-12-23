@@ -3,7 +3,6 @@ from HotelData import *
 # 实例化并运行
 hotel_data = HotelData(file_path='C:/Users/Lenovo/hotel_bookings.csv') #导入文件
 hotel_data.load_data() #加载数据集
-hotel_data.handle_missing_values() #显示缺失值情况
 
 #数据清洗
 
