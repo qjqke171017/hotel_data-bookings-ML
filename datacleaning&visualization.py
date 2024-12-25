@@ -96,3 +96,8 @@ plt.tight_layout()
 # 显示图表
 plt.show()
 
+# 使用Treemap展示不同酒店类型、国家和取消状态的关系
+fig = px.treemap(hotel_data.data, path=['hotel', 'country', 'is_canceled'], 
+                 title='Hotel Type vs Country vs Cancellation Rate', 
+                 color='is_canceled', hover_data=['hotel', 'country'])
+fig.show()
