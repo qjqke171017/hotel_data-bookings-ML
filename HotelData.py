@@ -14,7 +14,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns 
 import pandas as pd
-import plotly.graph_objects as go#可视化
+import plotly.graph_objects as go
+import plotly.express as px#可视化
 
 class HotelData: #构造酒店类
     def __init__(self, file_path):
