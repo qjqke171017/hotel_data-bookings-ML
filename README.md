@@ -1,5 +1,5 @@
 # hotel_data-bookings-ML
-编程基础大作业——酒店预订数据集研究
+酒店预订数据集研究
 Please run the code with the following order: HotelData -> datacleaning -> function_show -> machinelearning.
 
 HotelData类封装的函数如下：
