@@ -1,0 +1,52 @@
+# 路线三：二次侧 WLS 机理估计配置
+# 口径：normal_train 拟合与定阈值；normal_heldout + F03/F04/F06 评价。
+
+# 控制压差分组
+control_pressures: [0.8, 1.4, 1.65]
+control_pressure_tolerance: 0.2
+
+# 转速过滤：若原始转速为 0-100，保留 [50, 95)；若为 0-1，程序自动换算。
+wls_min_speed: 50
+wls_max_speed: 95
+
+# WLS 拟合参数
+wls_bins: 10
+min_rows_per_bin: 30
+min_sigma: 1.0e-6
+min_train_rows_per_control_group: 80
+
+# 阈值设置：主输出使用 main_threshold_quantile；其他分位数保存在 JSON 明细里。
+threshold_quantiles: [0.95, 0.975, 0.99, 0.9975, 0.9999]
+main_threshold_quantile: 0.9975
+
+# 重复实验与训练/测试划分
+n_repeats: 20
+train_normal_device_frac: 0.70
+random_state: 42
+
+# 模型定义
+models:
+  M1:
+    name: "泵压差模型"
+    target_columns: ["二次侧泵压差"]
+  M2:
+    name: "板换+供回水压差模型"
+    target_columns: ["二次侧板换压差", "二次侧供回水压差"]
+  M3:
+    name: "系统阻抗模型"
+    target_columns: ["二次侧板换压差", "二次侧过滤器压差"]
+
+# 数据读取与标签策略
+# F01/F02 是一次侧异常。二次侧 WLS 默认剔除；如需当作二次侧正常，改为 as_normal。
+f01_f02_mode: "exclude"
+skip_m_s_u: true
+csv_recursive: true
+csv_chunksize: 200000
+
+# 内存与抽样控制
+# 过滤转速和控制压差后，每个 CSV 最多保留这些记录参与训练/评价；设为 null 表示不过滤上限。
+max_rows_per_file: 5000
+# WLS 拟合阶段：每个训练设备、每个控制压差最多抽取这些记录。
+train_max_rows_per_device_per_control: 2000
+# WLS 拟合阶段：每个模型、每个控制压差训练记录总上限。
+train_max_rows_per_control_group: 200000

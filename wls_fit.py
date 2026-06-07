@@ -1,9 +1,10 @@
-"""WLS 拟合模块：加权最小二乘回归（报告 §4）。
+"""WLS 拟合模块：加权最小二乘回归。
 
-关键修复：
-1. 局部 sigma 赋值避免链式索引；
-2. 默认不把百万级数组转换为 Python list，避免内存暴涨；
-3. 提供 score_wls()，保证训练阈值和测试评分使用同一套标准化残差口径。
+核心约定：
+    score = |y - y_hat| / sigma_local
+
+本模块只保存 WLS 预测所需的轻量参数（beta、bin_edges、sigma_per_bin），
+避免把百万级预测数组写入 JSON 或长期占用内存。
 """
 
 from typing import Dict, Optional
@@ -12,7 +13,7 @@ import numpy as np
 
 
 def _wls_solve(X: np.ndarray, y: np.ndarray, w: Optional[np.ndarray] = None) -> np.ndarray:
-    """求解 WLS/OLS 正规方程。"""
+    """求解 OLS/WLS 正规方程。"""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
 
@@ -37,6 +38,7 @@ def _wls_solve(X: np.ndarray, y: np.ndarray, w: Optional[np.ndarray] = None) -> 
     if len(y) == 0:
         raise ValueError("有效样本数为 0，无法拟合 WLS/OLS 模型")
 
+    # 不构造 W = diag(w)，避免 N×N 大矩阵。
     XtWX = X.T @ (w[:, None] * X)
     XtWy = X.T @ (w * y)
 
@@ -48,11 +50,12 @@ def _wls_solve(X: np.ndarray, y: np.ndarray, w: Optional[np.ndarray] = None) -> 
 
 
 def _robust_sigma(residuals: np.ndarray, min_sigma: float = 1e-6) -> float:
-    """MAD-based 稳健尺度估计。"""
+    """MAD 稳健尺度估计；退化时回退到标准差。"""
     residuals = np.asarray(residuals, dtype=np.float64)
     residuals = residuals[np.isfinite(residuals)]
     if len(residuals) == 0:
         return float(min_sigma)
+
     med = np.nanmedian(residuals)
     mad = np.nanmedian(np.abs(residuals - med))
     sigma = 1.4826 * mad
@@ -64,21 +67,25 @@ def _robust_sigma(residuals: np.ndarray, min_sigma: float = 1e-6) -> float:
 
 
 def _make_bin_edges(x: np.ndarray, n_bins: int = 10) -> np.ndarray:
-    """等频分箱边界。"""
+    """按 x 的分位数构造等频分箱边界。"""
     x = np.asarray(x, dtype=np.float64)
     x = x[np.isfinite(x)]
     if len(x) == 0:
         return np.array([-np.inf, np.inf], dtype=np.float64)
+
+    n_bins = max(1, int(n_bins))
     edges = np.unique(np.quantile(x, np.linspace(0, 1, n_bins + 1)))
     if len(edges) < 3:
         return np.array([-np.inf, np.inf], dtype=np.float64)
+
     edges[0] = -np.inf
     edges[-1] = np.inf
     return edges.astype(np.float64)
 
 
 def _assign_bins(x: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    """按训练阶段保存的边界分配箱号。"""
+    """使用训练阶段保存的边界为样本分箱。"""
+    x = np.asarray(x, dtype=np.float64)
     edges = np.asarray(edges, dtype=np.float64)
     n_bins = max(1, len(edges) - 1)
     bins = np.searchsorted(edges[1:-1], x, side="right")
@@ -93,7 +100,7 @@ def score_wls(
     bin_edges: np.ndarray,
     min_sigma: float = 1e-6,
 ) -> np.ndarray:
-    """使用训练好的 WLS 参数计算标准化残差 score = |y-y_hat|/sigma_local。"""
+    """按训练好的 WLS 参数计算标准化残差分数。"""
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     beta = np.asarray(beta, dtype=np.float64)
@@ -108,12 +115,12 @@ def score_wls(
     x_v = x[valid]
     y_v = y[valid]
     y_hat = beta[0] + beta[1] * x_v
-    resid = y_v - y_hat
+    residual = y_v - y_hat
 
     bins = _assign_bins(x_v, bin_edges)
     bins = np.clip(bins, 0, len(sigma_per_bin) - 1)
-    local_sigma = sigma_per_bin[bins]
-    scores[valid] = np.abs(resid) / np.maximum(local_sigma, min_sigma)
+    sigma = sigma_per_bin[bins]
+    scores[valid] = np.abs(residual) / np.maximum(sigma, min_sigma)
     return scores
 
 
@@ -122,9 +129,19 @@ def fit_wls(
     y: np.ndarray,
     n_bins: int = 10,
     min_sigma: float = 1e-6,
-    return_full: bool = True,
+    min_rows_per_bin: int = 30,
+    return_full: bool = False,
 ) -> Dict:
-    """执行完整 WLS 五步拟合。"""
+    """执行 WLS 五步拟合，并返回轻量模型参数。
+
+    参数:
+        x: 自变量，即 (speed/100)^2。
+        y: 因变量。
+        n_bins: 分箱数量。
+        min_sigma: 局部 sigma 下界。
+        min_rows_per_bin: 单个分箱估计局部 sigma 的最小样本数。
+        return_full: 兼容参数；若为 True，额外返回训练数组的 score/residual。
+    """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
 
@@ -136,35 +153,33 @@ def fit_wls(
 
     X_v = np.column_stack([np.ones(len(x_v), dtype=np.float64), x_v])
 
-    # Step 1: OLS 初拟合
+    # Step 1: OLS 初拟合。
     beta_ols = _wls_solve(X_v, y_v)
     resid_ols = y_v - X_v @ beta_ols
 
-    # Step 2: 分箱估计初始 sigma
+    # Step 2: 分箱估计初始局部 sigma。
     bin_edges = _make_bin_edges(x_v, n_bins)
     n_actual_bins = len(bin_edges) - 1
     bins = _assign_bins(x_v, bin_edges)
 
     global_sigma0 = _robust_sigma(resid_ols, min_sigma)
-    sigma_per_bin = np.empty(n_actual_bins, dtype=np.float64)
+    sigma_init = np.empty(n_actual_bins, dtype=np.float64)
     for b in range(n_actual_bins):
-        mask = bins == b
-        sigma_per_bin[b] = _robust_sigma(resid_ols[mask], min_sigma) if mask.sum() >= 5 else global_sigma0
-    sigma_per_bin = np.maximum(sigma_per_bin, min_sigma)
+        m = bins == b
+        sigma_init[b] = _robust_sigma(resid_ols[m], min_sigma) if int(m.sum()) >= min_rows_per_bin else global_sigma0
+    sigma_init = np.maximum(sigma_init, min_sigma)
 
-    # Step 3: 权重
-    w = 1.0 / sigma_per_bin[bins] ** 2
-
-    # Step 4: WLS 拟合
+    # Step 3/4: WLS 拟合。
+    w = 1.0 / (sigma_init[bins] ** 2)
     beta = _wls_solve(X_v, y_v, w)
 
-    # Step 5: 用 WLS 残差重新估计 sigma
+    # Step 5: 用 WLS 残差重新估计最终局部 sigma。
     resid_wls = y_v - X_v @ beta
     global_sigma = _robust_sigma(resid_wls, min_sigma)
     sigma_final = np.empty(n_actual_bins, dtype=np.float64)
     for b in range(n_actual_bins):
-        mask = bins == b
-        sigma_final[b] = _robust_sigma(resid_wls[mask], min_sigma) if mask.sum() >= 5 else global_sigma
+        m = bins == b
+        sigma_final[b] = _robust_sigma(resid_wls[m], min_sigma) if int(m.sum()) >= min_rows_per_bin else global_sigma
     sigma_final = np.maximum(sigma_final, min_sigma)
 
     result = {
@@ -172,17 +187,18 @@ def fit_wls(
         "sigma_per_bin": sigma_final.tolist(),
         "bin_edges": bin_edges.tolist(),
         "n_valid": int(len(x_v)),
+        "global_sigma": float(global_sigma),
+        "x_min": float(np.nanmin(x_v)),
+        "x_max": float(np.nanmax(x_v)),
     }
 
     if return_full:
-        # 注意：这里返回 numpy 数组，而不是 Python list，避免百万级数据内存暴涨。
         pred_all = np.full(len(x), np.nan, dtype=np.float64)
         pred_all[valid] = X_v @ beta
         resid_all = np.full(len(x), np.nan, dtype=np.float64)
         resid_all[valid] = resid_wls
         scores = score_wls(x, y, beta, sigma_final, bin_edges, min_sigma=min_sigma)
         result.update({
-            "bin_assignments": bins,
             "predictions": pred_all,
             "residuals": resid_all,
             "scores": scores,
