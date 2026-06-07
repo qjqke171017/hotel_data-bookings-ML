@@ -1,26 +1,31 @@
-"""路线三：WLS 机理估计全流程编排。
+"""路线三：二次侧 WLS 机理异常检测全流程。
 
-以独立 WLS 脚本的实验口径为标准，本文件修复了以下关键问题：
-1. 按正常设备划分 normal_train / normal_heldout，评价使用 heldout 正常样本 + 异常样本；
-2. WLS 拟合和阈值计算只使用 normal_train，不混入异常样本；
-3. 阈值和测试均使用 score = |残差| / 局部 sigma；
-4. 读取阶段只保留 WLS 必需列，并支持每个 CSV 过滤后抽样，降低内存占用。
+本版 WLS Pipeline 按旧版 ``wls_secondary_multi_repeat_speed50_95.py`` 的实验协议修复：
+1. 按正常设备做 ``normal_train / normal_heldout`` 划分，而不是行级混合评价；
+2. 每个 repeat、每个模型、每个控制压差组只用 ``normal_train`` 拟合；
+3. 训练记录按“设备×控制压差”限额抽样，避免长序列设备支配斜率；
+4. 阈值来自对应控制压差组的 ``normal_train`` 标准化残差分位数；
+5. 指标只保留 heldout 口径，即 ``normal_heldout + anomaly``，不再输出 all_labeled；
+6. ``evaluation_report_metrics.csv`` 仍沿用项目现有扁平指标字段，但对多次重复取均值；
+   复杂的 repeat 细节、阈值、拟合参数和数据统计写入最终 JSON。
 """
 
+from __future__ import annotations
+
 import hashlib
-import json
+import math
 import os
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from evaluation.metrics import compute_sample_metrics
 from utils.config_loader import ensure_dir
 from utils.logging_config import setup_logging
-from models.wls.wls_fit import fit_wls, score_wls
+from models.wls.wls_fit import fit_wls, predict_wls
 
 
 class WLSPipeline:
@@ -41,429 +46,503 @@ class WLSPipeline:
         },
     }
 
-    _ENCODINGS = ["utf-8-sig", "utf-8", "gbk", "gb18030", "latin1"]
-    _SPEED_CANDIDATES = ["二次侧泵转速", "二次侧泵转速1", "二次侧泵转速2"]
-    _CONTROL_CANDIDATES = ["控制压差目标值", "二次侧控制压差目标值"]
-    _TARGET_CANDIDATES = {
-        "二次侧泵压差": ["二次侧泵压差"],
-        "二次侧板换压差": ["二次侧板换压差", "二次侧板换压差1", "二次侧板换压差2"],
-        "二次侧供回水压差": ["二次侧供回水压差"],
-        "二次侧过滤器压差": ["二次侧过滤器压差"],
-    }
+    SECONDARY_ANOMALY_CODES = {"F03", "F04", "F06"}
+    PRIMARY_ANOMALY_CODES = {"F01", "F02"}
+    UNLABELED_CODES = {"M", "S", "U"}
+    IGNORE_DIR_NAMES = {"正常数据分类分工况"}
 
     def __init__(self, config: dict):
         self.config = config or {}
-        # 允许 wls_config.yaml 覆盖模型列定义，但保留 M1/M2/M3 变量名。
-        cfg_models = self.config.get("models", {}) if isinstance(self.config.get("models", {}), dict) else {}
-        if cfg_models:
-            for model_id, model_def in cfg_models.items():
-                if model_id in self.MODELS:
-                    self.MODELS[model_id]["name"] = model_def.get("name", self.MODELS[model_id]["name"])
-                    self.MODELS[model_id]["target_cols"] = model_def.get(
-                        "target_columns",
-                        model_def.get("target_cols", self.MODELS[model_id]["target_cols"]),
-                    )
-
-    @staticmethod
-    def _resolve_column(columns: Sequence[str], candidates: List[str]) -> Optional[str]:
-        for c in candidates:
-            if c in columns:
-                return c
-        return None
-
-    @staticmethod
-    def _stable_seed(base: int, text: str) -> int:
-        h = hashlib.md5(str(text).encode("utf-8", errors="ignore")).hexdigest()
-        return (int(h[:8], 16) + int(base)) % (2**32 - 1)
-
-    def _prepare_csv_reader(self, fp: Path):
-        """确定编码、usecols 与逻辑列映射。"""
-        last_err = None
-        for enc in self._ENCODINGS:
-            try:
-                header = list(pd.read_csv(fp, encoding=enc, nrows=0).columns)
-                col_speed = self._resolve_column(header, self._SPEED_CANDIDATES)
-                col_control = self._resolve_column(header, self._CONTROL_CANDIDATES)
-                if not col_speed or not col_control:
-                    return None
-
-                logical_to_actual = {
-                    "__speed_raw__": col_speed,
-                    "__control_raw__": col_control,
+        model_cfg = self.config.get("models")
+        if isinstance(model_cfg, dict) and model_cfg:
+            self.MODELS = {
+                str(mid): {
+                    "name": cfg.get("name", str(mid)),
+                    "target_cols": cfg.get("target_columns") or cfg.get("target_cols") or [],
                 }
-                for logical, candidates in self._TARGET_CANDIDATES.items():
-                    actual = self._resolve_column(header, candidates)
-                    if actual:
-                        logical_to_actual[logical] = actual
+                for mid, cfg in model_cfg.items()
+            }
 
-                usecols = list(dict.fromkeys(logical_to_actual.values()))
-                return enc, logical_to_actual, usecols
-            except Exception as e:
-                last_err = e
-                continue
-        print(f"[WARN] CSV 表头读取失败：{fp}；最后错误：{last_err}")
-        return None
-
-    def _iter_required_csv_chunks(self, fp: Path):
-        """分块读取单个 CSV 的 WLS 必需列，并统一为逻辑列名。"""
-        prepared = self._prepare_csv_reader(fp)
-        if prepared is None:
-            return
-        enc, logical_to_actual, usecols = prepared
-        chunksize = self.config.get("csv_chunksize", 200000)
-        try:
-            chunks = pd.read_csv(fp, encoding=enc, usecols=usecols, chunksize=chunksize)
-        except TypeError:
-            chunks = [pd.read_csv(fp, encoding=enc, usecols=usecols)]
-        except Exception as e:
-            print(f"[WARN] CSV 读取失败：{fp}；错误：{e}")
-            return
-
-        try:
-            for raw in chunks:
-                out = pd.DataFrame(index=raw.index)
-                out["__speed_raw__"] = pd.to_numeric(raw[logical_to_actual["__speed_raw__"]], errors="coerce")
-                out["__control_raw__"] = pd.to_numeric(raw[logical_to_actual["__control_raw__"]], errors="coerce")
-                for logical in self._TARGET_CANDIDATES:
-                    actual = logical_to_actual.get(logical)
-                    if actual:
-                        out[logical] = pd.to_numeric(raw[actual], errors="coerce")
-                yield out
-        except Exception as e:
-            print(f"[WARN] CSV 分块处理失败：{fp}；错误：{e}")
-            return
-
-    def run(self, data_dir: str, output_root: str = None) -> Dict:
-        """执行 WLS 机理异常检测。"""
+    # ------------------------------------------------------------------
+    # 主入口
+    # ------------------------------------------------------------------
+    def run(self, data_dir: str, output_root: Optional[str] = None) -> Dict:
         if output_root is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_root = os.path.join("./output/wls", f"report_{timestamp}")
         output_root = ensure_dir(output_root)
         logger = setup_logging(output_root)
 
-        control_pressures = [float(x) for x in self.config.get("control_pressures", [0.8, 1.4, 1.65])]
-        wls_min_speed = float(self.config.get("wls_min_speed", 50))
-        wls_max_speed = float(self.config.get("wls_max_speed", 95))
-        wls_bins = int(self.config.get("wls_bins", 10))
-        min_sigma = float(self.config.get("min_sigma", 1e-6))
-        min_rows_per_bin = int(self.config.get("min_rows_per_bin", 30))
-        threshold_qs = [float(q) for q in self.config.get("threshold_quantiles", [0.95, 0.975, 0.99, 0.9975, 0.9999])]
-        main_q = float(self.config.get("main_threshold_quantile", 0.9975))
+        control_pressures = self._float_list(self.config.get("control_pressures", [0.8, 1.4, 1.65]))
+        control_round_digits = self._as_int(self.config.get("control_round_digits", 3), 3)
+        threshold_qs = self._float_list(self.config.get("threshold_quantiles", [0.95, 0.975, 0.99, 0.9975, 0.9999]))
+        main_q = self._as_float(self.config.get("main_threshold_quantile", 0.9975), 0.9975)
         if main_q not in threshold_qs:
-            threshold_qs = sorted(set(threshold_qs + [main_q]))
-        n_repeats = int(self.config.get("n_repeats", 20))
-        random_state = int(self.config.get("random_state", 42))
-        train_frac = float(self.config.get("train_normal_device_frac", 0.70))
+            main_q = threshold_qs[-2] if len(threshold_qs) >= 2 else threshold_qs[-1]
+
+        random_state = self._as_int(self.config.get("random_state", 42), 42)
+        n_repeats = self._as_int(self.config.get("n_repeats", 20), 20)
+        train_frac = self._as_float(self.config.get("train_normal_device_frac", 0.70), 0.70)
+        wls_min_speed = self._as_float(self.config.get("wls_min_speed", 50), 50.0)
+        wls_max_speed = self._as_float(self.config.get("wls_max_speed", 95), 95.0)
+        wls_bins = self._as_int(self.config.get("wls_bins", 10), 10)
+        min_sigma = self._as_float(self.config.get("min_sigma", 1e-6), 1e-6)
+        min_rows_per_bin = self._as_int(self.config.get("min_rows_per_bin", 30), 30)
+        min_train_rows = self._as_int(self.config.get("min_train_rows_per_control_group", 80), 80)
+        per_device_cap = self._none_or_int(self.config.get("train_max_rows_per_device_per_control", 2000))
+        group_cap = self._none_or_int(self.config.get("train_max_rows_per_control_group", 200000))
 
         logger.info(
-            f"开始 WLS 估计: control_pressures={control_pressures}, "
-            f"speed=[{wls_min_speed},{wls_max_speed}), bins={wls_bins}, repeats={n_repeats}"
+            "开始 WLS 估计: control_pressures=%s, speed=[%s,%s), bins=%s, repeats=%s, main_q=%s",
+            control_pressures,
+            wls_min_speed,
+            wls_max_speed,
+            wls_bins,
+            n_repeats,
+            main_q,
         )
 
-        data = self._load_data(data_dir, wls_min_speed, wls_max_speed)
+        data, read_logs = self._load_data(
+            data_dir=data_dir,
+            control_pressures=control_pressures,
+            control_round_digits=control_round_digits,
+            min_speed=wls_min_speed,
+            max_speed=wls_max_speed,
+            random_state=random_state,
+            logger=logger,
+        )
         if data is None or data.empty:
-            return {"error": "数据加载失败"}
-        logger.info(f"WLS 纳入记录数: {len(data):,}, 列数: {len(data.columns)}")
+            return {"error": "数据加载失败或无可用记录", "output_dir": output_root}
+
+        data_summary = self._summarize_data(data)
+        logger.info("纳入 WLS 分析记录数: %s", f"{len(data):,}")
 
         repeat_metrics: List[Dict] = []
-        repeat_models: List[Dict] = []
+        fit_rows: List[Dict] = []
+        split_summaries: List[Dict] = []
+        threshold_rows: List[Dict] = []
+        result_rows: List[Dict] = []
 
         for repeat in range(n_repeats):
-            logger.info(f"WLS repeat {repeat + 1}/{n_repeats}: 设备级划分")
-            split = self._split_normal_devices(data, repeat, train_frac, random_state)
-            repeat_model_summary = {"repeat": repeat, "models": {}}
+            logger.info("WLS repeat %s/%s: 设备级划分", repeat + 1, n_repeats)
+            split = self._split_normal_devices(data, repeat, random_state, train_frac)
+            split_summaries.extend(self._summarize_split(data, split, repeat))
 
             for model_id, model_def in self.MODELS.items():
-                repeat_model_summary["models"].setdefault(model_id, [])
-                for cp in control_pressures:
-                    cp_mask = np.isclose(data["control_pressure"].to_numpy(dtype=float), float(cp), atol=1e-9)
-                    if not cp_mask.any():
-                        continue
+                model_name = model_def.get("name", model_id)
+                target_cols = model_def.get("target_cols", [])
+                target = self._build_target(data, target_cols)
+                target_col = f"target__{model_id}"
+                data[target_col] = target
 
-                    target = self._build_target(data.loc[cp_mask], model_def["target_cols"])
-                    if target is None:
-                        logger.warning(f"{model_id}, control_pressure={cp}: 缺少因变量列，跳过")
-                        continue
+                models_by_cp: Dict[str, Dict] = {}
+                for cp in sorted(data["control_group"].dropna().astype(str).unique(), key=self._cp_sort_key):
+                    train_mask = (
+                        split.eq("normal_train")
+                        & data["control_group"].astype(str).eq(str(cp))
+                        & (~data["excluded_speed_range_for_wls"].astype(bool))
+                        & data["speed_sq"].notna()
+                        & data[target_col].notna()
+                    )
+                    train_df = data.loc[train_mask, ["device_key", "speed_sq", target_col]].copy()
+                    train_sampled = self._sample_train_rows(
+                        train=train_df,
+                        repeat=repeat,
+                        model_id=model_id,
+                        control_group=str(cp),
+                        random_state=random_state,
+                        per_device_cap=per_device_cap,
+                        group_cap=group_cap,
+                    )
 
-                    # 只用 normal_train 拟合 WLS；异常样本绝不参与拟合。
-                    sub_index = data.index[cp_mask]
-                    x_all = data.loc[sub_index, "speed_sq"].to_numpy(dtype=float)
-                    y_all = target
-                    label_all = data.loc[sub_index, "_label"].to_numpy(dtype=float)
-                    split_all = split.loc[sub_index].to_numpy(dtype=object)
-                    device_all = data.loc[sub_index, "device_key"].astype(str).to_numpy()
-
-                    valid_xy = np.isfinite(x_all) & np.isfinite(y_all)
-                    train_mask = valid_xy & (split_all == "normal_train") & (label_all == 0)
-                    if int(train_mask.sum()) < int(self.config.get("min_train_rows_per_control_group", 80)):
-                        logger.warning(
-                            f"repeat={repeat}, {model_id}, cp={cp}: normal_train 有效样本不足，跳过"
-                        )
-                        continue
-
-                    train_df = pd.DataFrame({
-                        "device_key": device_all[train_mask],
-                        "speed_sq": x_all[train_mask],
-                        "target": y_all[train_mask],
-                    })
-                    train_sample = self._sample_train_rows(train_df, repeat, model_id, cp, random_state)
-                    if len(train_sample) < int(self.config.get("min_train_rows_per_control_group", 80)):
-                        logger.warning(
-                            f"repeat={repeat}, {model_id}, cp={cp}: 抽样后训练样本不足，跳过"
-                        )
-                        continue
-
+                    fit_record = {
+                        "repeat": repeat,
+                        "model_id": model_id,
+                        "model_name": model_name,
+                        "control_pressure": self._maybe_float(cp),
+                        "fit_status": "ok",
+                        "train_rows_before_sample": int(len(train_df)),
+                        "train_rows_used": int(len(train_sampled)),
+                        "beta_0": np.nan,
+                        "beta_1": np.nan,
+                    }
                     try:
-                        model = fit_wls(
-                            train_sample["speed_sq"].to_numpy(dtype=float),
-                            train_sample["target"].to_numpy(dtype=float),
+                        fit_result = fit_wls(
+                            train_sampled["speed_sq"].to_numpy(dtype=float),
+                            train_sampled[target_col].to_numpy(dtype=float),
                             n_bins=wls_bins,
                             min_sigma=min_sigma,
                             min_rows_per_bin=min_rows_per_bin,
-                            return_full=False,
+                            min_train_rows=min_train_rows,
                         )
-                    except Exception as e:
-                        logger.warning(f"repeat={repeat}, {model_id}, cp={cp}: WLS 拟合失败：{e}")
-                        continue
+                        fit_result["control_pressure"] = self._maybe_float(cp)
+                        fit_result["model_id"] = model_id
+                        fit_result["model_name"] = model_name
+                        fit_result["target_cols"] = list(target_cols)
+                        models_by_cp[str(cp)] = fit_result
+                        fit_record.update({
+                            "beta_0": float(fit_result["beta0"]),
+                            "beta_1": float(fit_result["beta1"]),
+                            "n_train": int(fit_result["n_train"]),
+                            "global_sigma": float(fit_result["global_sigma"]),
+                        })
+                    except Exception as exc:
+                        fit_record["fit_status"] = f"failed: {exc}"
+                        logger.warning("%s control=%s repeat=%s 拟合失败: %s", model_id, cp, repeat, exc)
+                    fit_rows.append(fit_record)
 
-                    # 阈值只来自 normal_train 的标准化残差分数。
-                    train_scores = score_wls(
-                        x_all[train_mask],
-                        y_all[train_mask],
-                        np.asarray(model["beta"], dtype=float),
-                        np.asarray(model["sigma_per_bin"], dtype=float),
-                        np.asarray(model["bin_edges"], dtype=float),
-                        min_sigma=min_sigma,
-                    )
-                    train_scores = train_scores[np.isfinite(train_scores)]
-                    if len(train_scores) == 0:
-                        logger.warning(f"repeat={repeat}, {model_id}, cp={cp}: normal_train score 为空，跳过")
-                        continue
-                    thresholds = {f"q{q}": float(np.nanquantile(train_scores, q)) for q in threshold_qs}
-                    thr = thresholds.get(f"q{main_q}", float(np.nanquantile(train_scores, main_q)))
+                if not models_by_cp:
+                    continue
 
-                    # 主评价：normal_heldout + anomaly。
-                    eval_mask = valid_xy & ((split_all == "normal_heldout") | (split_all == "anomaly"))
-                    if int(eval_mask.sum()) == 0:
-                        logger.warning(f"repeat={repeat}, {model_id}, cp={cp}: 评价样本为空，跳过")
-                        continue
+                score_df = self._score_model(data, target_col, models_by_cp, min_sigma)
+                thresholds = self._thresholds_by_control(data, split, score_df["score"], threshold_qs)
 
-                    eval_scores = score_wls(
-                        x_all[eval_mask],
-                        y_all[eval_mask],
-                        np.asarray(model["beta"], dtype=float),
-                        np.asarray(model["sigma_per_bin"], dtype=float),
-                        np.asarray(model["bin_edges"], dtype=float),
-                        min_sigma=min_sigma,
-                    )
-                    valid_eval_score = np.isfinite(eval_scores)
-                    y_true = label_all[eval_mask][valid_eval_score].astype(int)
-                    y_pred = (eval_scores[valid_eval_score] >= thr).astype(int)
-                    metrics = compute_sample_metrics(y_true, y_pred)
+                for cp, thr_map in thresholds.items():
+                    for q, thr in thr_map.items():
+                        threshold_rows.append({
+                            "repeat": repeat,
+                            "model_id": model_id,
+                            "model_name": model_name,
+                            "control_pressure": self._maybe_float(cp),
+                            "threshold_quantile": float(q),
+                            "threshold": thr,
+                        })
 
-                    beta = model["beta"]
-                    row = {
+                rows = self._build_heldout_metrics(
+                    data=data,
+                    split=split,
+                    score=score_df["score"],
+                    model_id=model_id,
+                    model_name=model_name,
+                    repeat=repeat,
+                    thresholds=thresholds,
+                    quantiles=threshold_qs,
+                    fit_rows_for_repeat=[r for r in fit_rows if r.get("repeat") == repeat and r.get("model_id") == model_id],
+                )
+                repeat_metrics.extend(rows)
+
+                # JSON 中保留每次 repeat 的模型和阈值细节；不写额外 CSV，保持项目输出路径不变。
+                for cp, m in models_by_cp.items():
+                    result_rows.append({
                         "repeat": repeat,
-                        "model": model_id,
-                        "control_pressure": float(cp),
-                        "beta_0": float(beta[0]),
-                        "beta_1": float(beta[1]),
-                        "threshold": float(thr),
-                        **metrics,
-                    }
-                    repeat_metrics.append(row)
-
-                    repeat_model_summary["models"][model_id].append({
-                        "control_pressure": float(cp),
-                        "beta": model["beta"],
-                        "threshold": float(thr),
-                        "thresholds": thresholds,
-                        "train_rows_before_sample": int(train_mask.sum()),
-                        "train_rows_used": int(len(train_sample)),
-                        "eval_rows": int(len(y_true)),
+                        "model_id": model_id,
+                        "model_name": model_name,
+                        "control_pressure": self._maybe_float(cp),
+                        "beta": m.get("beta"),
+                        "beta_0": m.get("beta0"),
+                        "beta_1": m.get("beta1"),
+                        "n_train": m.get("n_train"),
+                        "bin_edges": m.get("bin_edges"),
+                        "sigma_by_bin": m.get("sigma_by_bin"),
+                        "global_sigma": m.get("global_sigma"),
+                        "thresholds": {f"q{q}": thresholds.get(cp, {}).get(q, np.nan) for q in threshold_qs},
                     })
 
-                    del train_df, train_sample, model, train_scores, eval_scores
-
-            repeat_models.append(repeat_model_summary)
-
-        if not repeat_metrics:
-            return {"error": "WLS 没有产生有效指标，请检查训练样本、列名和控制压差配置。"}
-
-        metrics = self._average_metrics_for_report(repeat_metrics, control_pressures)
-
-        # 每次实验明细单独保存 JSON；evaluation_report.json 也会包含同样信息。
-        repeat_json_path = os.path.join(output_root, "wls_repeat_metrics.json")
-        try:
-            with open(repeat_json_path, "w", encoding="utf-8") as f:
-                json.dump({"repeat_metrics": repeat_metrics, "repeat_models": repeat_models}, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"保存 WLS repeat JSON 失败：{e}")
+        # CSV 使用项目现有 metrics 扁平格式，但多次重复取均值，只保留 heldout + 主阈值 + 分控制压差。
+        avg_metrics = self._average_metrics_for_csv(repeat_metrics, main_q)
+        avg_results = self._average_results(result_rows)
 
         return {
-            "results": {"repeat_models": repeat_models},
-            "repeat_metrics": repeat_metrics,
-            "metrics": metrics,
+            "results": avg_results,
+            "metrics": avg_metrics,
             "output_dir": output_root,
             "config": {
                 "control_pressures": control_pressures,
+                "control_round_digits": control_round_digits,
+                "wls_min_speed": wls_min_speed,
+                "wls_max_speed": wls_max_speed,
                 "wls_bins": wls_bins,
+                "min_sigma": min_sigma,
+                "min_rows_per_bin": min_rows_per_bin,
+                "min_train_rows_per_control_group": min_train_rows,
                 "threshold_quantiles": threshold_qs,
                 "main_threshold_quantile": main_q,
                 "n_repeats": n_repeats,
                 "train_normal_device_frac": train_frac,
-                "eval_scope": "normal_heldout + anomaly",
+                "random_state": random_state,
+                "f01_f02_mode": self.config.get("f01_f02_mode", "exclude"),
+                "sampling_note": (
+                    "每次重复先按设备划分正常样本；WLS 拟合只使用 normal_train；"
+                    "每个训练设备、每个控制压差组最多抽取 train_max_rows_per_device_per_control 条记录；"
+                    "阈值来自对应控制压差组 normal_train score 分位数；评价只使用 heldout。"
+                ),
+            },
+            "details": {
+                "data_summary": data_summary,
+                "read_logs": read_logs,
+                "split_summaries": split_summaries,
+                "fit_models_by_repeat": fit_rows,
+                "thresholds_by_repeat": threshold_rows,
+                "heldout_metrics_by_repeat": repeat_metrics,
             },
         }
 
-    def _load_data(self, data_dir: str, min_speed: float, max_speed: float) -> pd.DataFrame:
-        """加载并预处理二次侧数据，只保留 WLS 必需列。"""
+    # ------------------------------------------------------------------
+    # 数据读取与预处理
+    # ------------------------------------------------------------------
+    def _load_data(
+        self,
+        data_dir: str,
+        control_pressures: Sequence[float],
+        control_round_digits: int,
+        min_speed: float,
+        max_speed: float,
+        random_state: int,
+        logger,
+    ) -> Tuple[pd.DataFrame, List[Dict]]:
         root = Path(data_dir)
         if not root.exists():
             raise FileNotFoundError(f"数据目录不存在: {root}")
 
-        f01_f02_mode = str(self.config.get("f01_f02_mode", "exclude")).lower()
-        skip_m_s_u = bool(self.config.get("skip_m_s_u", True))
+        max_rows = self._none_or_int(
+            self.config.get("data_max_rows_per_file", self.config.get("max_rows_per_file", 5000))
+        )
+        chunksize = self._as_int(self.config.get("csv_chunksize", 200000), 200000)
+        recursive = self._as_bool(self.config.get("csv_recursive", True), True)
+        f01_f02_mode = str(self.config.get("f01_f02_mode", "exclude")).strip().lower()
+        skip_unlabeled = self._as_bool(self.config.get("skip_m_s_u", self.config.get("skip_unlabeled", True)), True)
 
-        folders: Dict[str, Optional[int]] = {"N": 0, "F03": 1, "F04": 1, "F06": 1}
-        if f01_f02_mode == "as_normal":
-            folders.update({"F01": 0, "F02": 0})
-        elif f01_f02_mode != "exclude":
-            print(f"[WARN] 未知 f01_f02_mode={f01_f02_mode}，按 exclude 处理")
-        if not skip_m_s_u:
-            # 当前主指标不使用未标注样本。为避免污染训练/评价，这里仍不纳入。
-            print("[WARN] WLS 主指标不使用 M/S/U；skip_m_s_u=False 时仍不会纳入训练和评价。")
+        required_cols = self._required_columns()
+        scale = 10 ** int(control_round_digits)
+        allowed_keys = {int(round(float(v) * scale)) for v in control_pressures}
 
-        valid_cps = np.asarray(self.config.get("control_pressures", [0.8, 1.4, 1.65]), dtype=np.float64)
-        cp_tolerance = float(self.config.get("control_pressure_tolerance", 0.2))
-        max_rows_per_file = self.config.get("max_rows_per_file", None)
-        cap = None if max_rows_per_file in (None, "", "none", "None") else int(max_rows_per_file)
-        csv_recursive = bool(self.config.get("csv_recursive", True))
-        random_state = int(self.config.get("random_state", 42))
+        frames: List[pd.DataFrame] = []
+        read_logs: List[Dict] = []
 
-        frames = []
-        file_count = 0
-        kept_count = 0
-
-        for folder_name, label in folders.items():
-            folder_path = root / folder_name
-            if not folder_path.exists():
+        for code_dir in sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name):
+            if code_dir.name.strip() in self.IGNORE_DIR_NAMES:
                 continue
-            csv_files = sorted(folder_path.rglob("*.csv") if csv_recursive else folder_path.glob("*.csv"))
+            code = code_dir.name.strip().upper()
+            label = self._label_from_code(code, f01_f02_mode)
+
+            if label is None and code in self.PRIMARY_ANOMALY_CODES and f01_f02_mode == "exclude":
+                logger.info("跳过 %s: f01_f02_mode=exclude", code)
+                continue
+            if code in self.UNLABELED_CODES and skip_unlabeled:
+                logger.info("跳过 %s: skip_m_s_u=True", code)
+                continue
+            if code.startswith("F") and code not in self.SECONDARY_ANOMALY_CODES and code not in self.PRIMARY_ANOMALY_CODES:
+                logger.warning("跳过未定义 F 文件夹 %s，请确认是否属于二次侧异常", code)
+                continue
+            if not (code == "N" or code in self.SECONDARY_ANOMALY_CODES or code in self.PRIMARY_ANOMALY_CODES or code in self.UNLABELED_CODES):
+                continue
+
+            csv_files = sorted(code_dir.rglob("*.csv") if recursive else code_dir.glob("*.csv"))
+            logger.info("读取 %s: %s 个 CSV", code, len(csv_files))
+
             for fp in csv_files:
-                file_count += 1
-                file_kept = None
-                rng = np.random.default_rng(self._stable_seed(random_state, str(fp)))
-
-                for chunk in self._iter_required_csv_chunks(fp):
-                    if chunk is None or chunk.empty:
+                try:
+                    seed = self._stable_seed(random_state, str(fp))
+                    raw = self._read_csv_selected(fp, required_cols, max_rows, chunksize, seed)
+                    if raw.empty:
                         continue
 
-                    speed_raw = chunk["__speed_raw__"]
-                    control = chunk["__control_raw__"]
-                    speed_95 = speed_raw.dropna().quantile(0.95) if speed_raw.notna().any() else np.nan
-                    if pd.notna(speed_95) and speed_95 > 2:
-                        speed_norm = speed_raw / 100.0
-                    else:
-                        speed_norm = speed_raw
+                    df = pd.DataFrame(index=raw.index)
+                    for col in required_cols:
+                        df[col] = self._to_numeric(raw[col])
+                    df["row_id"] = raw["row_id"].astype(np.int64)
 
-                    speed_mask = (speed_norm * 100 >= min_speed) & (speed_norm * 100 < max_speed)
-
-                    ctrl = control.to_numpy(dtype=np.float64)
-                    rounded = np.full(len(ctrl), np.nan, dtype=np.float64)
-                    ok_ctrl = np.isfinite(ctrl)
-                    if ok_ctrl.any():
-                        nearest_idx = np.argmin(np.abs(ctrl[ok_ctrl, None] - valid_cps[None, :]), axis=1)
-                        rounded[ok_ctrl] = valid_cps[nearest_idx]
-                    cp_diff = np.abs(ctrl - rounded)
-                    cp_mask = np.isfinite(cp_diff) & (cp_diff < cp_tolerance)
-
-                    keep = speed_mask.to_numpy(dtype=bool) & cp_mask
-                    keep_idx = np.flatnonzero(keep)
-                    if len(keep_idx) == 0:
+                    cp_key = self._control_key_from_values(df["控制压差目标值"], control_round_digits)
+                    before = len(df)
+                    keep = cp_key.isin(allowed_keys)
+                    df = df.loc[keep].copy()
+                    cp_key = cp_key.loc[keep]
+                    if df.empty:
+                        read_logs.append({
+                            "source_code": code,
+                            "device_name": fp.stem,
+                            "file_path": str(fp),
+                            "read_rows": int(before),
+                            "kept_rows": 0,
+                            "status": "no_valid_control_pressure",
+                        })
                         continue
 
-                    out = pd.DataFrame(index=np.arange(len(keep_idx)))
-                    out["speed_norm"] = speed_norm.to_numpy(dtype=np.float32)[keep_idx]
-                    out["speed_sq"] = (out["speed_norm"].to_numpy(dtype=np.float32) ** 2).astype(np.float32)
-                    out["control_pressure"] = rounded[keep_idx]
-                    out["_label"] = np.int8(label)
-                    out["_folder"] = folder_name
-                    out["device_name"] = fp.stem
-                    out["device_key"] = f"{folder_name}/{fp.stem}"
+                    df["control_pressure_key"] = cp_key.astype(np.int64)
+                    df["control_group"] = (df["control_pressure_key"] / scale).map(lambda x: f"{float(x):g}")
+                    df["control_pressure"] = df["control_pressure_key"] / scale
+                    df["speed_raw"] = df["二次侧泵转速"]
+                    df["speed_norm"] = self._normalize_speed(df["speed_raw"])
+                    df["speed_sq"] = df["speed_norm"] ** 2
+                    df["excluded_speed_range_for_wls"] = self._speed_range_exclusion_mask(
+                        df["speed_raw"], min_speed, max_speed
+                    )
+                    df["source_code"] = code
+                    df["device_name"] = fp.stem
+                    df["file_path"] = str(fp)
+                    df["device_key"] = code + "/" + fp.stem
+                    df["binary_label"] = np.nan if label is None else int(label)
+                    df["label_name"] = df["binary_label"].map({0: "normal", 1: "secondary_anomaly"}).fillna("unlabeled")
 
-                    for logical in self._TARGET_CANDIDATES:
-                        if logical in chunk.columns:
-                            out[logical] = chunk[logical].to_numpy(dtype=np.float32)[keep_idx]
-                        else:
-                            out[logical] = np.nan
-
-                    if cap is not None and cap > 0:
-                        out["__rand_key__"] = rng.random(len(out))
-                        if file_kept is None:
-                            file_kept = out
-                        else:
-                            file_kept = pd.concat([file_kept, out], ignore_index=True, copy=False)
-                        if len(file_kept) > cap:
-                            file_kept = file_kept.nsmallest(cap, "__rand_key__").reset_index(drop=True)
-                    else:
-                        frames.append(out)
-                        kept_count += len(out)
-
-                if cap is not None and cap > 0 and file_kept is not None and not file_kept.empty:
-                    file_kept = file_kept.sort_values("__rand_key__").drop(columns=["__rand_key__"]).reset_index(drop=True)
-                    frames.append(file_kept)
-                    kept_count += len(file_kept)
+                    keep_cols = [
+                        "source_code",
+                        "device_name",
+                        "file_path",
+                        "device_key",
+                        "row_id",
+                        "binary_label",
+                        "label_name",
+                        "control_group",
+                        "control_pressure",
+                        "control_pressure_key",
+                        "控制压差目标值",
+                        "speed_raw",
+                        "speed_norm",
+                        "speed_sq",
+                        "excluded_speed_range_for_wls",
+                    ] + required_cols
+                    # 去重，避免 required_cols 中已有控制压差/转速列导致重复。
+                    keep_cols = list(dict.fromkeys(keep_cols))
+                    frames.append(df[keep_cols].reset_index(drop=True))
+                    read_logs.append({
+                        "source_code": code,
+                        "device_name": fp.stem,
+                        "file_path": str(fp),
+                        "read_rows": int(before),
+                        "kept_rows": int(len(df)),
+                        "status": "ok",
+                    })
+                except Exception as exc:
+                    logger.error("读取失败: %s; 错误: %s", fp, exc)
+                    read_logs.append({
+                        "source_code": code,
+                        "device_name": fp.stem,
+                        "file_path": str(fp),
+                        "read_rows": 0,
+                        "kept_rows": 0,
+                        "status": f"error: {exc}",
+                    })
 
         if not frames:
-            return pd.DataFrame()
+            return pd.DataFrame(), read_logs
 
-        combined = pd.concat(frames, ignore_index=True, copy=False)
-        combined["_folder"] = combined["_folder"].astype("category")
-        combined["device_name"] = combined["device_name"].astype("category")
-        combined["device_key"] = combined["device_key"].astype("category")
-        combined["_label"] = combined["_label"].astype(np.int8)
+        data = pd.concat(frames, ignore_index=True)
+        for c in ["source_code", "device_name", "file_path", "device_key", "label_name", "control_group"]:
+            data[c] = data[c].astype("category")
+        return data, read_logs
 
-        print(
-            f"[INFO] WLS读取完成：CSV文件 {file_count} 个，过滤后记录 {kept_count:,} 条，"
-            f"保留列 {len(combined.columns)} 列"
-        )
-        return combined
-
-    def _build_target(self, df: pd.DataFrame, target_cols: list) -> Optional[np.ndarray]:
-        """构造 WLS 模型因变量 y。"""
-        values = []
-        for tc in target_cols:
-            if tc not in df.columns:
-                return None
-            values.append(pd.to_numeric(df[tc], errors="coerce").to_numpy(dtype=float))
-        if len(values) == 1:
-            return values[0]
-        return np.column_stack(values).sum(axis=1)
-
-    def _split_normal_devices(
+    def _read_csv_selected(
         self,
-        data: pd.DataFrame,
-        repeat: int,
-        train_frac: float,
+        path: Path,
+        usecols: List[str],
+        max_rows: Optional[int],
+        chunksize: int,
         random_state: int,
-    ) -> pd.Series:
-        """按正常设备划分 normal_train / normal_heldout；异常样本只进入评价。"""
-        normal_keys = np.array(sorted(data.loc[data["_label"].eq(0), "device_key"].astype(str).unique()))
-        if len(normal_keys) < 2:
-            raise RuntimeError("正常设备数量少于 2，无法做设备级训练/测试划分。")
+    ) -> pd.DataFrame:
+        encodings = ["utf-8-sig", "utf-8", "gbk", "gb18030", "latin1"]
+        last_err: Optional[Exception] = None
+        for enc in encodings:
+            try:
+                header = list(pd.read_csv(path, encoding=enc, nrows=0).columns)
+                missing = [c for c in usecols if c not in header]
+                if missing:
+                    raise RuntimeError(f"缺少必需列 {missing}")
 
-        rng = np.random.default_rng(random_state + repeat * 1009)
+                if max_rows is None:
+                    df = pd.read_csv(path, encoding=enc, usecols=usecols)
+                    df["row_id"] = np.arange(len(df), dtype=np.int64)
+                    return df
+
+                rng = np.random.default_rng(random_state)
+                kept: Optional[pd.DataFrame] = None
+                offset = 0
+                for chunk in pd.read_csv(path, encoding=enc, usecols=usecols, chunksize=chunksize):
+                    n = len(chunk)
+                    chunk = chunk.copy()
+                    chunk["row_id"] = np.arange(offset, offset + n, dtype=np.int64)
+                    chunk["__rand_key__"] = rng.random(n)
+                    offset += n
+                    kept = chunk if kept is None else pd.concat([kept, chunk], ignore_index=True)
+                    if len(kept) > max_rows:
+                        kept = kept.nsmallest(max_rows, "__rand_key__")
+                if kept is None:
+                    return pd.DataFrame(columns=usecols + ["row_id"])
+                kept = kept.sort_values("row_id").drop(columns=["__rand_key__"])
+                return kept.reset_index(drop=True)
+            except Exception as exc:
+                last_err = exc
+                continue
+        raise RuntimeError(f"无法读取 CSV：{path}；最后错误：{last_err}")
+
+    def _required_columns(self) -> List[str]:
+        cols = {"二次侧泵转速", "控制压差目标值"}
+        for cfg in self.MODELS.values():
+            cols.update(cfg.get("target_cols", []))
+        return list(cols)
+
+    @staticmethod
+    def _to_numeric(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_numeric_dtype(series):
+            return pd.to_numeric(series, errors="coerce")
+        s = series.astype(str).str.strip()
+        s = (
+            s.str.replace("−", "-", regex=False)
+            .str.replace("－", "-", regex=False)
+            .str.replace("，", ".", regex=False)
+        )
+        direct = pd.to_numeric(s, errors="coerce")
+        need = direct.isna() & s.notna() & ~s.str.lower().isin(["", "nan", "none", "null"])
+        if need.any():
+            extracted = s[need].str.extract(r"([-+]?\d+(?:[\.,]\d+)?)", expand=False)
+            extracted = extracted.str.replace(",", ".", regex=False)
+            direct.loc[need] = pd.to_numeric(extracted, errors="coerce")
+        return direct
+
+    @staticmethod
+    def _control_key_from_values(values: pd.Series, digits: int) -> pd.Series:
+        scale = 10 ** int(digits)
+        x = pd.to_numeric(values, errors="coerce").astype("float64")
+        out = pd.Series(np.nan, index=values.index, dtype="float64")
+        ok = x.notna()
+        out.loc[ok] = np.rint(x.loc[ok] * scale)
+        return out
+
+    @staticmethod
+    def _normalize_speed(speed_raw: pd.Series) -> pd.Series:
+        speed = pd.to_numeric(speed_raw, errors="coerce")
+        q95 = speed.dropna().quantile(0.95) if speed.notna().any() else np.nan
+        if pd.notna(q95) and q95 > 2:
+            return speed / 100.0
+        return speed
+
+    @staticmethod
+    def _speed_range_exclusion_mask(speed_raw: pd.Series, min_speed: float, max_speed: float) -> pd.Series:
+        x = pd.to_numeric(speed_raw, errors="coerce")
+        q95 = x.dropna().quantile(0.95) if x.notna().any() else np.nan
+        if pd.notna(q95) and q95 > 2:
+            low, high = float(min_speed), float(max_speed)
+        else:
+            low, high = float(min_speed) / 100.0, float(max_speed) / 100.0
+        return x.isna() | (x < low) | (x >= high)
+
+    def _label_from_code(self, code: str, f01_f02_mode: str) -> Optional[int]:
+        code = code.upper()
+        if code == "N":
+            return 0
+        if code in self.SECONDARY_ANOMALY_CODES:
+            return 1
+        if code in self.PRIMARY_ANOMALY_CODES:
+            return 0 if f01_f02_mode == "as_normal" else None
+        return None
+
+    # ------------------------------------------------------------------
+    # 训练、打分、阈值、指标
+    # ------------------------------------------------------------------
+    def _split_normal_devices(self, data: pd.DataFrame, repeat: int, random_state: int, train_frac: float) -> pd.Series:
+        rng = np.random.default_rng(int(random_state) + int(repeat) * 1009)
+        normal_keys = np.array(sorted(data.loc[data["binary_label"].eq(0), "device_key"].dropna().astype(str).unique()))
+        if len(normal_keys) < 2:
+            raise RuntimeError("正常设备数量少于 2，无法做设备级训练/留出划分。")
         rng.shuffle(normal_keys)
-        n_train = max(1, int(round(len(normal_keys) * train_frac)))
+        n_train = max(1, int(round(len(normal_keys) * float(train_frac))))
         n_train = min(n_train, len(normal_keys) - 1)
         train_keys = set(normal_keys[:n_train])
 
-        split = pd.Series("ignore", index=data.index, dtype="object")
+        split = pd.Series("unlabeled", index=data.index, dtype="object")
         device_str = data["device_key"].astype(str)
-        split.loc[data["_label"].eq(1)] = "anomaly"
-        split.loc[data["_label"].eq(0) & device_str.isin(train_keys)] = "normal_train"
-        split.loc[data["_label"].eq(0) & ~device_str.isin(train_keys)] = "normal_heldout"
+        split.loc[data["binary_label"].eq(1)] = "anomaly"
+        split.loc[data["binary_label"].eq(0) & device_str.isin(train_keys)] = "normal_train"
+        split.loc[data["binary_label"].eq(0) & ~device_str.isin(train_keys)] = "normal_heldout"
         return split
 
     def _sample_train_rows(
@@ -471,62 +550,363 @@ class WLSPipeline:
         train: pd.DataFrame,
         repeat: int,
         model_id: str,
-        control_pressure: float,
+        control_group: str,
         random_state: int,
+        per_device_cap: Optional[int],
+        group_cap: Optional[int],
     ) -> pd.DataFrame:
-        """每个训练设备、每个控制压差组内限制训练记录数，避免长序列设备支配斜率。"""
         if train.empty:
             return train
-
-        per_dev_cap = self.config.get("train_max_rows_per_device_per_control", 2000)
-        group_cap = self.config.get("train_max_rows_per_control_group", 200000)
-        per_dev_cap = None if per_dev_cap in (None, "", "none", "None") else int(per_dev_cap)
-        group_cap = None if group_cap in (None, "", "none", "None") else int(group_cap)
-
         parts = []
         for dev, sub in train.groupby("device_key", observed=True):
-            if per_dev_cap is not None and per_dev_cap > 0 and len(sub) > per_dev_cap:
-                seed = self._stable_seed(random_state + repeat * 1009, f"{model_id}|{control_pressure}|{dev}")
-                parts.append(sub.sample(n=per_dev_cap, random_state=seed))
+            if per_device_cap is not None and len(sub) > per_device_cap:
+                seed = self._stable_seed(random_state + repeat * 1009, f"{model_id}|{control_group}|{dev}")
+                parts.append(sub.sample(n=per_device_cap, random_state=seed))
             else:
                 parts.append(sub)
-        out = pd.concat(parts, axis=0, ignore_index=True) if parts else train.iloc[0:0].copy()
-
-        if group_cap is not None and group_cap > 0 and len(out) > group_cap:
-            seed = self._stable_seed(random_state + repeat * 1013, f"{model_id}|{control_pressure}|group_cap")
-            out = out.sample(n=group_cap, random_state=seed).reset_index(drop=True)
+        out = pd.concat(parts, axis=0) if parts else train.iloc[0:0]
+        if group_cap is not None and len(out) > group_cap:
+            seed = self._stable_seed(random_state + repeat * 1013, f"{model_id}|{control_group}|group_cap")
+            out = out.sample(n=group_cap, random_state=seed)
         return out
+
+    def _build_target(self, df: pd.DataFrame, target_cols: Sequence[str]) -> pd.Series:
+        missing = [c for c in target_cols if c not in df.columns]
+        if missing:
+            raise RuntimeError(f"缺少模型因变量列: {missing}")
+        values = [pd.to_numeric(df[c], errors="coerce") for c in target_cols]
+        if len(values) == 1:
+            return values[0]
+        return pd.concat(values, axis=1).sum(axis=1, min_count=len(values))
+
+    def _score_model(self, data: pd.DataFrame, target_col: str, models_by_cp: Dict[str, Dict], min_sigma: float) -> pd.DataFrame:
+        out = pd.DataFrame(index=data.index)
+        out["score"] = np.nan
+        out["residual"] = np.nan
+        out["yhat"] = np.nan
+        out["sigma"] = np.nan
+        out["model_available"] = False
+
+        valid_common = (
+            (~data["excluded_speed_range_for_wls"].astype(bool))
+            & data["speed_sq"].notna()
+            & data[target_col].notna()
+        )
+        for cp, model in models_by_cp.items():
+            idx = data.index[valid_common & data["control_group"].astype(str).eq(str(cp))]
+            if len(idx) == 0:
+                continue
+            x = data.loc[idx, "speed_sq"].to_numpy(dtype=float)
+            y = data.loc[idx, target_col].to_numpy(dtype=float)
+            yhat, sigma = predict_wls(x, model)
+            resid = y - yhat
+            score = np.abs(resid) / np.maximum(sigma, float(min_sigma))
+            out.loc[idx, "score"] = score
+            out.loc[idx, "residual"] = resid
+            out.loc[idx, "yhat"] = yhat
+            out.loc[idx, "sigma"] = sigma
+            out.loc[idx, "model_available"] = True
+        return out
+
+    def _thresholds_by_control(
+        self,
+        data: pd.DataFrame,
+        split: pd.Series,
+        score: pd.Series,
+        quantiles: Sequence[float],
+    ) -> Dict[str, Dict[float, float]]:
+        thresholds: Dict[str, Dict[float, float]] = {}
+        for cp in sorted(data["control_group"].dropna().astype(str).unique(), key=self._cp_sort_key):
+            s = score.loc[split.eq("normal_train") & data["control_group"].astype(str).eq(str(cp))].dropna()
+            if len(s) == 0:
+                thresholds[str(cp)] = {float(q): np.nan for q in quantiles}
+            else:
+                thresholds[str(cp)] = {float(q): float(np.nanquantile(s.to_numpy(dtype=float), q)) for q in quantiles}
+        return thresholds
+
+    def _build_heldout_metrics(
+        self,
+        data: pd.DataFrame,
+        split: pd.Series,
+        score: pd.Series,
+        model_id: str,
+        model_name: str,
+        repeat: int,
+        thresholds: Dict[str, Dict[float, float]],
+        quantiles: Sequence[float],
+        fit_rows_for_repeat: List[Dict],
+    ) -> List[Dict]:
+        rows: List[Dict] = []
+        y_true_all = data["binary_label"].to_numpy(dtype=float)
+        score_all = score.to_numpy(dtype=float)
+        fit_by_cp = {str(r.get("control_pressure")): r for r in fit_rows_for_repeat}
+        # 同时兼容 1.4 / "1.4" 这种键。
+        fit_by_cp.update({f"{float(r.get('control_pressure')):g}": r for r in fit_rows_for_repeat if pd.notna(r.get("control_pressure"))})
+
+        heldout_mask = split.isin(["normal_heldout", "anomaly"]) & data["binary_label"].notna()
+
+        for q in quantiles:
+            row_threshold = np.full(len(data), np.nan, dtype=float)
+            for cp, thr_map in thresholds.items():
+                thr = thr_map.get(float(q), np.nan)
+                idx = data.index[data["control_group"].astype(str).eq(str(cp))]
+                row_threshold[idx] = thr
+            y_pred_all = (score_all >= row_threshold).astype(float)
+            y_pred_all[~np.isfinite(score_all) | ~np.isfinite(row_threshold)] = np.nan
+
+            # JSON 里保留三组合并的 heldout/all；CSV 汇总时会过滤掉 all，保持当前 CSV 结构简洁。
+            m_all = self._metric_from_arrays(
+                y_true_all[heldout_mask.values], score_all[heldout_mask.values], y_pred_all[heldout_mask.values]
+            )
+            rows.append({
+                "repeat": repeat,
+                "model_id": model_id,
+                "model_name": model_name,
+                "eval_scope": "heldout",
+                "control_pressure": "all",
+                "threshold_quantile": float(q),
+                "threshold": np.nan,
+                **m_all,
+            })
+
+            for cp in sorted(thresholds, key=self._cp_sort_key):
+                mask = heldout_mask & data["control_group"].astype(str).eq(str(cp))
+                m = self._metric_from_arrays(y_true_all[mask.values], score_all[mask.values], y_pred_all[mask.values])
+                fit_info = fit_by_cp.get(str(cp), {})
+                rows.append({
+                    "repeat": repeat,
+                    "model_id": model_id,
+                    "model_name": model_name,
+                    "eval_scope": "heldout",
+                    "control_pressure": self._maybe_float(cp),
+                    "threshold_quantile": float(q),
+                    "threshold": thresholds[cp].get(float(q), np.nan),
+                    "beta_0": fit_info.get("beta_0", np.nan),
+                    "beta_1": fit_info.get("beta_1", np.nan),
+                    **m,
+                })
+        return rows
 
     @staticmethod
-    def _average_metrics_for_report(repeat_metrics: List[Dict], control_pressures: List[float]) -> Dict[str, List[Dict]]:
-        """将多次重复实验指标压缩为 evaluation_report_metrics.csv 需要的平均行。"""
+    def _metric_from_arrays(y_true: np.ndarray, score: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+        mask = np.isfinite(y_true) & np.isfinite(score) & np.isfinite(y_pred)
+        y_true = y_true[mask].astype(int)
+        y_pred = y_pred[mask].astype(int)
+        if len(y_true) == 0:
+            return {
+                "n": 0,
+                "normal_count": 0,
+                "anomaly_count": 0,
+                "TP": 0,
+                "FP": 0,
+                "TN": 0,
+                "FN": 0,
+                "precision": np.nan,
+                "recall": np.nan,
+                "f1": np.nan,
+                "fpr": np.nan,
+                "fnr": np.nan,
+                "accuracy": np.nan,
+                "mcc": np.nan,
+                "balanced_accuracy": np.nan,
+            }
+
+        tp = int(((y_true == 1) & (y_pred == 1)).sum())
+        fp = int(((y_true == 0) & (y_pred == 1)).sum())
+        tn = int(((y_true == 0) & (y_pred == 0)).sum())
+        fn = int(((y_true == 1) & (y_pred == 0)).sum())
+        normal_count = tn + fp
+        anomaly_count = tp + fn
+        pred_pos = tp + fp
+        n = len(y_true)
+
+        precision = tp / pred_pos if pred_pos else np.nan
+        recall = tp / anomaly_count if anomaly_count else np.nan
+        fpr = fp / normal_count if normal_count else np.nan
+        fnr = fn / anomaly_count if anomaly_count else np.nan
+        accuracy = (tp + tn) / n if n else np.nan
+        f1 = 2 * precision * recall / (precision + recall) if pd.notna(precision) and pd.notna(recall) and (precision + recall) > 0 else np.nan
+        denom = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        mcc = ((tp * tn - fp * fn) / denom) if denom > 0 else np.nan
+        tnr = tn / normal_count if normal_count else np.nan
+        balanced_accuracy = np.nanmean([recall, tnr]) if (pd.notna(recall) or pd.notna(tnr)) else np.nan
+
+        return {
+            "n": int(n),
+            "normal_count": int(normal_count),
+            "anomaly_count": int(anomaly_count),
+            "TP": tp,
+            "FP": fp,
+            "TN": tn,
+            "FN": fn,
+            "precision": float(precision) if pd.notna(precision) else np.nan,
+            "recall": float(recall) if pd.notna(recall) else np.nan,
+            "f1": float(f1) if pd.notna(f1) else np.nan,
+            "fpr": float(fpr) if pd.notna(fpr) else np.nan,
+            "fnr": float(fnr) if pd.notna(fnr) else np.nan,
+            "accuracy": float(accuracy) if pd.notna(accuracy) else np.nan,
+            "mcc": float(mcc) if pd.notna(mcc) else np.nan,
+            "balanced_accuracy": float(balanced_accuracy) if pd.notna(balanced_accuracy) else np.nan,
+        }
+
+    def _average_metrics_for_csv(self, repeat_metrics: List[Dict], main_q: float) -> Dict[str, List[Dict]]:
+        if not repeat_metrics:
+            return {mid: [] for mid in self.MODELS}
         df = pd.DataFrame(repeat_metrics)
+        df = df[
+            (df["eval_scope"] == "heldout")
+            & (df["control_pressure"].astype(str) != "all")
+            & np.isclose(pd.to_numeric(df["threshold_quantile"], errors="coerce"), float(main_q))
+        ].copy()
         if df.empty:
-            return {}
+            return {mid: [] for mid in self.MODELS}
 
-        # 保持截图中的列名和列顺序；repeat 只保留在 JSON 明细中，不进入 CSV。
-        count_cols = ["TP", "FP", "TN", "FN"]
-        metric_cols = ["precision", "recall", "f1", "fpr", "fnr", "accuracy"]
-        out: Dict[str, List[Dict]] = {}
+        current_metric_cols = [
+            "beta_0",
+            "beta_1",
+            "threshold",
+            "TP",
+            "FP",
+            "TN",
+            "FN",
+            "precision",
+            "recall",
+            "f1",
+            "fpr",
+            "fnr",
+            "accuracy",
+        ]
+        rows_by_model: Dict[str, List[Dict]] = {mid: [] for mid in self.MODELS}
+        group_cols = ["model_id", "model_name", "control_pressure", "threshold_quantile"]
+        for key, sub in df.groupby(group_cols, dropna=False):
+            model_id, model_name, cp, q = key
+            row = {
+                "control_pressure": self._maybe_float(cp),
+                "threshold_quantile": float(q),
+                "repeat_count": int(sub["repeat"].nunique()),
+            }
+            for c in current_metric_cols:
+                if c in sub.columns:
+                    row[c] = self._nanmean_or_nan(sub[c])
+            rows_by_model.setdefault(str(model_id), []).append(row)
+        for model_id in rows_by_model:
+            rows_by_model[model_id] = sorted(rows_by_model[model_id], key=lambda r: self._cp_sort_key(r.get("control_pressure")))
+        return rows_by_model
 
-        for model_id, mdf in df.groupby("model", sort=True):
-            rows = []
-            for cp, sub in mdf.groupby("control_pressure", sort=True):
-                row = {
-                    "control_pressure": float(cp),
-                    "beta_0": float(sub["beta_0"].mean()),
-                    "beta_1": float(sub["beta_1"].mean()),
-                    "threshold": float(sub["threshold"].mean()),
-                }
-                for c in count_cols:
-                    # 这是重复实验的平均混淆矩阵计数；四舍五入后便于和原截图保持一致。
-                    row[c] = int(round(float(sub[c].mean())))
-                for c in metric_cols:
-                    row[c] = float(sub[c].mean())
-                rows.append(row)
-
-            # 按配置中的控制压差顺序输出。
-            cp_order = {float(cp): i for i, cp in enumerate(control_pressures)}
-            rows = sorted(rows, key=lambda r: cp_order.get(float(r["control_pressure"]), 999))
-            out[model_id] = rows
+    def _average_results(self, result_rows: List[Dict]) -> Dict[str, List[Dict]]:
+        if not result_rows:
+            return {mid: [] for mid in self.MODELS}
+        df = pd.DataFrame(result_rows)
+        out: Dict[str, List[Dict]] = {mid: [] for mid in self.MODELS}
+        for (model_id, model_name, cp), sub in df.groupby(["model_id", "model_name", "control_pressure"], dropna=False):
+            thresholds = {}
+            # thresholds 是 dict 列，需要手工聚合。
+            all_qs = sorted({q for d in sub["thresholds"].dropna() for q in d.keys()})
+            for q in all_qs:
+                vals = [d.get(q, np.nan) for d in sub["thresholds"] if isinstance(d, dict)]
+                thresholds[q] = self._nanmean_or_nan(vals)
+            out.setdefault(str(model_id), []).append({
+                "control_pressure": self._maybe_float(cp),
+                "beta": [self._nanmean_or_nan(sub["beta_0"]), self._nanmean_or_nan(sub["beta_1"])],
+                "beta_0": self._nanmean_or_nan(sub["beta_0"]),
+                "beta_1": self._nanmean_or_nan(sub["beta_1"]),
+                "n_train_mean": self._nanmean_or_nan(sub["n_train"]),
+                "thresholds": thresholds,
+                "repeat_count": int(sub["repeat"].nunique()),
+            })
+        for model_id in out:
+            out[model_id] = sorted(out[model_id], key=lambda r: self._cp_sort_key(r.get("control_pressure")))
         return out
+
+    # ------------------------------------------------------------------
+    # 汇总与小工具
+    # ------------------------------------------------------------------
+    def _summarize_data(self, data: pd.DataFrame) -> List[Dict]:
+        if data.empty:
+            return []
+        summary = (
+            data.groupby(["control_group", "source_code", "label_name"], observed=True, dropna=False)
+            .size()
+            .reset_index(name="records")
+        )
+        return summary.to_dict("records")
+
+    def _summarize_split(self, data: pd.DataFrame, split: pd.Series, repeat: int) -> List[Dict]:
+        tmp = data[["source_code", "label_name"]].copy()
+        tmp["split"] = split.values
+        summary = tmp.groupby(["source_code", "label_name", "split"], observed=True, dropna=False).size().reset_index(name="records")
+        summary["repeat"] = repeat
+        return summary.to_dict("records")
+
+    @staticmethod
+    def _stable_seed(base: int, text: str) -> int:
+        h = hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
+        return (int(h[:8], 16) + int(base)) % (2**32 - 1)
+
+    @staticmethod
+    def _float_list(value) -> List[float]:
+        if isinstance(value, str):
+            return sorted({float(x.strip()) for x in value.split(",") if x.strip()})
+        if isinstance(value, Iterable):
+            return sorted({float(x) for x in value})
+        return [float(value)]
+
+    @staticmethod
+    def _as_float(value, default: float) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _as_int(value, default: int) -> int:
+        try:
+            if value is None:
+                return int(default)
+            return int(value)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _as_bool(value, default: bool) -> bool:
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        s = str(value).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
+
+    @staticmethod
+    def _none_or_int(value) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip().lower() in {"none", "null", "", "nan"}:
+            return None
+        out = int(value)
+        return None if out <= 0 else out
+
+    @staticmethod
+    def _maybe_float(value):
+        try:
+            return float(value)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _cp_sort_key(value):
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _nanmean_or_nan(values) -> float:
+        arr = pd.to_numeric(pd.Series(list(values)), errors="coerce").to_numpy(dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(arr.mean()) if len(arr) else np.nan

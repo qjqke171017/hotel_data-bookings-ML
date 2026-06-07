@@ -1,25 +1,27 @@
 # 路线三：二次侧 WLS 机理估计配置
-# 口径：normal_train 拟合与定阈值；normal_heldout + F03/F04/F06 评价。
+# 本配置与旧版 wls_secondary_multi_repeat_speed50_95.py 的实验逻辑对齐：
+# 设备级划分正常训练/留出、分控制压差建模、分控制压差定阈值、heldout 评价。
 
-# 控制压差分组
+# 控制压差分组：仅研究这些工况；采用 control_round_digits 取整匹配，不使用 0.2 宽容差。
 control_pressures: [0.8, 1.4, 1.65]
-control_pressure_tolerance: 0.2
+control_round_digits: 3
 
-# 转速过滤：若原始转速为 0-100，保留 [50, 95)；若为 0-1，程序自动换算。
+# 转速过滤：WLS 拟合、阈值和评价只使用该区间内记录。
+# 若转速列为 0-100 量纲，保留 [50, 95)；若已归一化为 0-1，自动转成 [0.50, 0.95)。
 wls_min_speed: 50
 wls_max_speed: 95
 
 # WLS 拟合参数
 wls_bins: 10
 min_rows_per_bin: 30
-min_sigma: 1.0e-6
+min_sigma: 1e-6
 min_train_rows_per_control_group: 80
 
-# 阈值设置：主输出使用 main_threshold_quantile；其他分位数保存在 JSON 明细里。
+# 阈值分位数：阈值来自每个控制压差组 normal_train score 的分位数。
 threshold_quantiles: [0.95, 0.975, 0.99, 0.9975, 0.9999]
 main_threshold_quantile: 0.9975
 
-# 重复实验与训练/测试划分
+# 重复实验
 n_repeats: 20
 train_normal_device_frac: 0.70
 random_state: 42
@@ -36,17 +38,16 @@ models:
     name: "系统阻抗模型"
     target_columns: ["二次侧板换压差", "二次侧过滤器压差"]
 
-# 数据读取与标签策略
-# F01/F02 是一次侧异常。二次侧 WLS 默认剔除；如需当作二次侧正常，改为 as_normal。
-f01_f02_mode: "exclude"
-skip_m_s_u: true
-csv_recursive: true
+# 数据过滤与抽样
+f01_f02_mode: "exclude"        # exclude：剔除 F01/F02；as_normal：作为二次侧正常样本
+skip_m_s_u: true               # true：完全跳过 M/S/U
+csv_recursive: true            # true：递归读取子目录 CSV
+max_rows_per_file: 5000        # None 或 0 表示每个 CSV 全量读取；整数表示均匀随机抽样
 csv_chunksize: 200000
 
-# 内存与抽样控制
-# 过滤转速和控制压差后，每个 CSV 最多保留这些记录参与训练/评价；设为 null 表示不过滤上限。
-max_rows_per_file: 5000
-# WLS 拟合阶段：每个训练设备、每个控制压差最多抽取这些记录。
+# 训练抽样：每个训练设备、每个控制压差组最多抽取指定记录数，避免长序列设备支配回归。
 train_max_rows_per_device_per_control: 2000
-# WLS 拟合阶段：每个模型、每个控制压差训练记录总上限。
 train_max_rows_per_control_group: 200000
+
+# 可视化参数保留给项目其他模块；当前 WLS Pipeline 不额外写图，避免改变项目输出结构。
+plot_sample_size: 20000
